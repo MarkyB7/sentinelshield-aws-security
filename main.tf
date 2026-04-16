@@ -13,12 +13,72 @@ locals {
   log_bucket_name      = "${local.name_prefix}-logs-${data.aws_caller_identity.current.account_id}-${random_id.suffix.hex}"
   config_bucket_name   = "${local.name_prefix}-config-${data.aws_caller_identity.current.account_id}-${random_id.suffix.hex}"
   frontend_bucket_name = var.frontend_bucket_name_override != null ? var.frontend_bucket_name_override : "${local.name_prefix}-frontend-${data.aws_caller_identity.current.account_id}-${random_id.suffix.hex}"
+  access_logs_bucket   = "${local.name_prefix}-access-logs-${data.aws_caller_identity.current.account_id}-${random_id.suffix.hex}"
+}
+
+# -------------------------
+# KMS
+# -------------------------
+data "aws_iam_policy_document" "kms_policy" {
+  statement {
+    sid    = "EnableRootPermissions"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+
+    actions   = ["kms:*"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "AllowCloudTrailUseOfKey"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudtrail.amazonaws.com"]
+    }
+
+    actions = [
+      "kms:GenerateDataKey*",
+      "kms:Decrypt",
+      "kms:Encrypt",
+      "kms:ReEncrypt*",
+      "kms:DescribeKey"
+    ]
+
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "AllowCloudWatchLogsUseOfKey"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["logs.${var.aws_region}.amazonaws.com"]
+    }
+
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:DescribeKey"
+    ]
+
+    resources = ["*"]
+  }
 }
 
 resource "aws_kms_key" "main" {
   description             = "SentinelShield KMS key"
   deletion_window_in_days = 10
   enable_key_rotation     = true
+  policy                  = data.aws_iam_policy_document.kms_policy.json
 
   tags = {
     Name = "${local.name_prefix}-kms-key"
@@ -30,6 +90,9 @@ resource "aws_kms_alias" "main" {
   target_key_id = aws_kms_key.main.key_id
 }
 
+# -------------------------
+# VPC
+# -------------------------
 resource "aws_vpc" "main" {
   cidr_block           = var.vpc_cidr
   enable_dns_support   = true
@@ -52,7 +115,7 @@ resource "aws_subnet" "public_1" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = var.public_subnet_1_cidr
   availability_zone       = data.aws_availability_zones.available.names[0]
-  map_public_ip_on_launch = true
+  map_public_ip_on_launch = false
 
   tags = {
     Name = "${local.name_prefix}-public-1"
@@ -64,7 +127,7 @@ resource "aws_subnet" "public_2" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = var.public_subnet_2_cidr
   availability_zone       = data.aws_availability_zones.available.names[1]
-  map_public_ip_on_launch = true
+  map_public_ip_on_launch = false
 
   tags = {
     Name = "${local.name_prefix}-public-2"
@@ -143,58 +206,58 @@ resource "aws_route_table_association" "private_2_assoc" {
   route_table_id = aws_route_table.private_2.id
 }
 
-resource "aws_security_group" "alb_sg" {
-  name        = "${local.name_prefix}-alb-sg"
-  description = "Allow HTTPS inbound"
-  vpc_id      = aws_vpc.main.id
+# -------------------------
+# Access log bucket
+# -------------------------
+resource "aws_s3_bucket" "access_logs" {
+  bucket = local.access_logs_bucket
+}
 
-  ingress {
-    description = "HTTPS from internet"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+resource "aws_s3_bucket_versioning" "access_logs_versioning" {
+  bucket = aws_s3_bucket.access_logs.id
 
-  egress {
-    description = "Allow all outbound"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "${local.name_prefix}-alb-sg"
+  versioning_configuration {
+    status = "Enabled"
   }
 }
 
-resource "aws_security_group" "app_sg" {
-  name        = "${local.name_prefix}-app-sg"
-  description = "Allow app traffic only from ALB SG"
-  vpc_id      = aws_vpc.main.id
+resource "aws_s3_bucket_ownership_controls" "access_logs_ownership" {
+  bucket = aws_s3_bucket.access_logs.id
 
-  ingress {
-    description     = "App traffic from ALB"
-    from_port       = 8080
-    to_port         = 8080
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb_sg.id]
-  }
-
-  egress {
-    description = "Allow all outbound"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "${local.name_prefix}-app-sg"
+  rule {
+    object_ownership = "BucketOwnerPreferred"
   }
 }
 
+resource "aws_s3_bucket_acl" "access_logs_acl" {
+  depends_on = [aws_s3_bucket_ownership_controls.access_logs_ownership]
+
+  bucket = aws_s3_bucket.access_logs.id
+  acl    = "log-delivery-write"
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "access_logs_encryption" {
+  bucket = aws_s3_bucket.access_logs.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.main.arn
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "access_logs_pab" {
+  bucket                  = aws_s3_bucket.access_logs.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# -------------------------
+# CloudTrail bucket
+# -------------------------
 resource "aws_s3_bucket" "cloudtrail_logs" {
   bucket = local.log_bucket_name
 }
@@ -226,6 +289,15 @@ resource "aws_s3_bucket_public_access_block" "cloudtrail_logs_pab" {
   restrict_public_buckets = true
 }
 
+resource "aws_s3_bucket_logging" "cloudtrail_logging" {
+  bucket        = aws_s3_bucket.cloudtrail_logs.id
+  target_bucket = aws_s3_bucket.access_logs.id
+  target_prefix = "cloudtrail-bucket/"
+}
+
+# -------------------------
+# Config bucket
+# -------------------------
 resource "aws_s3_bucket" "config_logs" {
   bucket = local.config_bucket_name
 }
@@ -257,6 +329,55 @@ resource "aws_s3_bucket_public_access_block" "config_logs_pab" {
   restrict_public_buckets = true
 }
 
+resource "aws_s3_bucket_logging" "config_logging" {
+  bucket        = aws_s3_bucket.config_logs.id
+  target_bucket = aws_s3_bucket.access_logs.id
+  target_prefix = "config-bucket/"
+}
+
+# -------------------------
+# Frontend bucket
+# -------------------------
+resource "aws_s3_bucket" "frontend" {
+  bucket = local.frontend_bucket_name
+}
+
+resource "aws_s3_bucket_versioning" "frontend_versioning" {
+  bucket = aws_s3_bucket.frontend.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "frontend_encryption" {
+  bucket = aws_s3_bucket.frontend.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.main.arn
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "frontend_pab" {
+  bucket                  = aws_s3_bucket.frontend.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_logging" "frontend_logging" {
+  bucket        = aws_s3_bucket.frontend.id
+  target_bucket = aws_s3_bucket.access_logs.id
+  target_prefix = "frontend-bucket/"
+}
+
+# -------------------------
+# Bucket policies
+# -------------------------
 data "aws_iam_policy_document" "cloudtrail_bucket_policy" {
   statement {
     sid    = "AWSCloudTrailAclCheck"
@@ -296,64 +417,6 @@ data "aws_iam_policy_document" "cloudtrail_bucket_policy" {
 resource "aws_s3_bucket_policy" "cloudtrail_bucket_policy" {
   bucket = aws_s3_bucket.cloudtrail_logs.id
   policy = data.aws_iam_policy_document.cloudtrail_bucket_policy.json
-}
-
-data "aws_iam_policy_document" "flowlogs_assume_role" {
-  statement {
-    effect = "Allow"
-
-    principals {
-      type        = "Service"
-      identifiers = ["vpc-flow-logs.amazonaws.com"]
-    }
-
-    actions = ["sts:AssumeRole"]
-  }
-}
-
-resource "aws_iam_role" "flowlogs_role" {
-  name               = "${local.name_prefix}-flowlogs-role"
-  assume_role_policy = data.aws_iam_policy_document.flowlogs_assume_role.json
-}
-
-resource "aws_iam_role_policy_attachment" "flowlogs_policy" {
-  role       = aws_iam_role.flowlogs_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
-}
-
-resource "aws_cloudwatch_log_group" "flowlogs" {
-  name              = "/aws/vpc/${local.name_prefix}-flowlogs"
-  retention_in_days = 30
-}
-
-resource "aws_flow_log" "main" {
-  iam_role_arn    = aws_iam_role.flowlogs_role.arn
-  log_destination = aws_cloudwatch_log_group.flowlogs.arn
-  traffic_type    = "ALL"
-  vpc_id          = aws_vpc.main.id
-}
-
-data "aws_iam_policy_document" "config_assume_role" {
-  statement {
-    effect = "Allow"
-
-    principals {
-      type        = "Service"
-      identifiers = ["config.amazonaws.com"]
-    }
-
-    actions = ["sts:AssumeRole"]
-  }
-}
-
-resource "aws_iam_role" "config_role" {
-  name               = "${local.name_prefix}-config-role"
-  assume_role_policy = data.aws_iam_policy_document.config_assume_role.json
-}
-
-resource "aws_iam_role_policy_attachment" "config_managed_policy" {
-  role       = aws_iam_role.config_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWS_ConfigRole"
 }
 
 data "aws_iam_policy_document" "config_bucket_policy" {
@@ -397,6 +460,32 @@ resource "aws_s3_bucket_policy" "config_bucket_policy" {
   policy = data.aws_iam_policy_document.config_bucket_policy.json
 }
 
+# -------------------------
+# AWS Config
+# -------------------------
+data "aws_iam_policy_document" "config_assume_role" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["config.amazonaws.com"]
+    }
+
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+resource "aws_iam_role" "config_role" {
+  name               = "${local.name_prefix}-config-role"
+  assume_role_policy = data.aws_iam_policy_document.config_assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "config_managed_policy" {
+  role       = aws_iam_role.config_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWS_ConfigRole"
+}
+
 resource "aws_config_configuration_recorder" "main" {
   name     = "${local.name_prefix}-recorder"
   role_arn = aws_iam_role.config_role.arn
@@ -421,12 +510,129 @@ resource "aws_config_configuration_recorder_status" "main" {
   depends_on = [aws_config_delivery_channel.main]
 }
 
+# -------------------------
+# CloudWatch log groups
+# -------------------------
+resource "aws_cloudwatch_log_group" "flowlogs" {
+  name              = "/aws/vpc/${local.name_prefix}-flowlogs"
+  retention_in_days = 30
+  kms_key_id        = aws_kms_key.main.arn
+}
+
+resource "aws_cloudwatch_log_group" "cloudtrail" {
+  name              = "/aws/cloudtrail/${local.name_prefix}"
+  retention_in_days = 30
+  kms_key_id        = aws_kms_key.main.arn
+}
+
+resource "aws_cloudwatch_log_group" "apigw" {
+  name              = "/aws/apigateway/${local.name_prefix}"
+  retention_in_days = 30
+  kms_key_id        = aws_kms_key.main.arn
+}
+
+# -------------------------
+# Flow logs
+# -------------------------
+data "aws_iam_policy_document" "flowlogs_assume_role" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["vpc-flow-logs.amazonaws.com"]
+    }
+
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+resource "aws_iam_role" "flowlogs_role" {
+  name               = "${local.name_prefix}-flowlogs-role"
+  assume_role_policy = data.aws_iam_policy_document.flowlogs_assume_role.json
+}
+
+data "aws_iam_policy_document" "flowlogs_policy_doc" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+      "logs:DescribeLogGroups",
+      "logs:DescribeLogStreams"
+    ]
+    resources = [
+      aws_cloudwatch_log_group.flowlogs.arn,
+      "${aws_cloudwatch_log_group.flowlogs.arn}:*"
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "flowlogs_policy" {
+  name   = "${local.name_prefix}-flowlogs-policy"
+  role   = aws_iam_role.flowlogs_role.id
+  policy = data.aws_iam_policy_document.flowlogs_policy_doc.json
+}
+
+resource "aws_flow_log" "main" {
+  iam_role_arn    = aws_iam_role.flowlogs_role.arn
+  log_destination = aws_cloudwatch_log_group.flowlogs.arn
+  traffic_type    = "REJECT"
+  vpc_id          = aws_vpc.main.id
+}
+
+# -------------------------
+# CloudTrail -> CloudWatch Logs
+# -------------------------
+data "aws_iam_policy_document" "cloudtrail_logs_assume_role" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudtrail.amazonaws.com"]
+    }
+
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+resource "aws_iam_role" "cloudtrail_logs_role" {
+  name               = "${local.name_prefix}-cloudtrail-logs-role"
+  assume_role_policy = data.aws_iam_policy_document.cloudtrail_logs_assume_role.json
+}
+
+data "aws_iam_policy_document" "cloudtrail_logs_policy_doc" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogStream",
+      "logs:PutLogEvents"
+    ]
+    resources = [
+      "${aws_cloudwatch_log_group.cloudtrail.arn}:*"
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "cloudtrail_logs_policy" {
+  name   = "${local.name_prefix}-cloudtrail-logs-policy"
+  role   = aws_iam_role.cloudtrail_logs_role.id
+  policy = data.aws_iam_policy_document.cloudtrail_logs_policy_doc.json
+}
+
+# -------------------------
+# CloudTrail
+# -------------------------
 resource "aws_cloudtrail" "main" {
   name                          = "${local.name_prefix}-trail"
   s3_bucket_name                = aws_s3_bucket.cloudtrail_logs.bucket
   include_global_service_events = true
   is_multi_region_trail         = true
   enable_log_file_validation    = true
+  kms_key_id                    = aws_kms_key.main.arn
+  cloud_watch_logs_group_arn    = "${aws_cloudwatch_log_group.cloudtrail.arn}:*"
+  cloud_watch_logs_role_arn     = aws_iam_role.cloudtrail_logs_role.arn
 
   event_selector {
     read_write_type           = "All"
@@ -436,6 +642,9 @@ resource "aws_cloudtrail" "main" {
   depends_on = [aws_s3_bucket_policy.cloudtrail_bucket_policy]
 }
 
+# -------------------------
+# GuardDuty / Security Hub
+# -------------------------
 resource "aws_guardduty_detector" "main" {
   enable = true
 }
@@ -465,41 +674,47 @@ resource "aws_securityhub_standards_subscription" "cis" {
 }
 
 # -------------------------
-# Frontend S3 bucket
+# WAF
 # -------------------------
-resource "aws_s3_bucket" "frontend" {
-  bucket = local.frontend_bucket_name
-}
+resource "aws_wafv2_web_acl" "cloudfront" {
+  name  = "${local.name_prefix}-cloudfront-waf"
+  scope = "CLOUDFRONT"
 
-resource "aws_s3_bucket_versioning" "frontend_versioning" {
-  bucket = aws_s3_bucket.frontend.id
-
-  versioning_configuration {
-    status = "Enabled"
+  default_action {
+    allow {}
   }
-}
 
-resource "aws_s3_bucket_server_side_encryption_configuration" "frontend_encryption" {
-  bucket = aws_s3_bucket.frontend.id
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "${local.name_prefix}-cloudfront-waf"
+    sampled_requests_enabled   = true
+  }
 
   rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm     = "aws:kms"
-      kms_master_key_id = aws_kms_key.main.arn
+    name     = "AWSManagedCommonRuleSet"
+    priority = 1
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesCommonRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name_prefix}-common-rules"
+      sampled_requests_enabled   = true
     }
   }
 }
 
-resource "aws_s3_bucket_public_access_block" "frontend_pab" {
-  bucket                  = aws_s3_bucket.frontend.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
 # -------------------------
-# CloudFront OAC
+# CloudFront
 # -------------------------
 resource "aws_cloudfront_origin_access_control" "frontend_oac" {
   name                              = "${local.name_prefix}-frontend-oac"
@@ -507,6 +722,53 @@ resource "aws_cloudfront_origin_access_control" "frontend_oac" {
   origin_access_control_origin_type = "s3"
   signing_behavior                  = "always"
   signing_protocol                  = "sigv4"
+}
+
+resource "aws_cloudfront_distribution" "frontend" {
+  enabled             = true
+  default_root_object = "index.html"
+  web_acl_id          = aws_wafv2_web_acl.cloudfront.arn
+
+  origin {
+    domain_name              = aws_s3_bucket.frontend.bucket_regional_domain_name
+    origin_id                = "frontend-s3-origin"
+    origin_access_control_id = aws_cloudfront_origin_access_control.frontend_oac.id
+  }
+
+  default_cache_behavior {
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "frontend-s3-origin"
+    viewer_protocol_policy = "redirect-to-https"
+    compress               = true
+
+    forwarded_values {
+      query_string = false
+
+      cookies {
+        forward = "none"
+      }
+    }
+  }
+
+  logging_config {
+    bucket          = aws_s3_bucket.access_logs.bucket_domain_name
+    include_cookies = false
+    prefix          = "cloudfront/"
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+    minimum_protocol_version       = "TLSv1.2_2021"
+  }
+
+  depends_on = [aws_s3_bucket.frontend]
 }
 
 data "aws_iam_policy_document" "frontend_bucket_policy" {
@@ -533,45 +795,6 @@ data "aws_iam_policy_document" "frontend_bucket_policy" {
 resource "aws_s3_bucket_policy" "frontend_policy" {
   bucket = aws_s3_bucket.frontend.id
   policy = data.aws_iam_policy_document.frontend_bucket_policy.json
-}
-
-resource "aws_cloudfront_distribution" "frontend" {
-  enabled             = true
-  default_root_object = "index.html"
-
-  origin {
-    domain_name              = aws_s3_bucket.frontend.bucket_regional_domain_name
-    origin_id                = "frontend-s3-origin"
-    origin_access_control_id = aws_cloudfront_origin_access_control.frontend_oac.id
-  }
-
-  default_cache_behavior {
-    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
-    cached_methods         = ["GET", "HEAD"]
-    target_origin_id       = "frontend-s3-origin"
-    viewer_protocol_policy = "redirect-to-https"
-    compress               = true
-
-    forwarded_values {
-      query_string = false
-
-      cookies {
-        forward = "none"
-      }
-    }
-  }
-
-  restrictions {
-    geo_restriction {
-      restriction_type = "none"
-    }
-  }
-
-  viewer_certificate {
-    cloudfront_default_certificate = true
-  }
-
-  depends_on = [aws_s3_bucket.frontend]
 }
 
 # -------------------------
@@ -628,7 +851,7 @@ resource "aws_cognito_user_pool_domain" "main" {
 }
 
 # -------------------------
-# Lambda
+# Lambda package
 # -------------------------
 data "archive_file" "lambda_zip" {
   type        = "zip"
@@ -659,13 +882,18 @@ resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
 }
 
 resource "aws_lambda_function" "api" {
-  function_name    = "${local.name_prefix}-api"
-  role             = aws_iam_role.lambda_exec.arn
-  handler          = "app.handler"
-  runtime          = "python3.12"
+  function_name = "${local.name_prefix}-api"
+  role          = aws_iam_role.lambda_exec.arn
+  handler       = "app.handler"
+  runtime       = "python3.12"
+
   filename         = data.archive_file.lambda_zip.output_path
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
   timeout          = 10
+
+  tracing_config {
+    mode = "Active"
+  }
 
   environment {
     variables = {
@@ -733,6 +961,20 @@ resource "aws_apigatewayv2_stage" "default" {
   api_id      = aws_apigatewayv2_api.main.id
   name        = "$default"
   auto_deploy = true
+
+  access_log_settings {
+    destination_arn = aws_cloudwatch_log_group.apigw.arn
+    format = jsonencode({
+      requestId      = "$context.requestId"
+      ip             = "$context.identity.sourceIp"
+      requestTime    = "$context.requestTime"
+      httpMethod     = "$context.httpMethod"
+      routeKey       = "$context.routeKey"
+      status         = "$context.status"
+      protocol       = "$context.protocol"
+      responseLength = "$context.responseLength"
+    })
+  }
 }
 
 resource "aws_lambda_permission" "allow_apigw" {
