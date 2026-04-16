@@ -551,7 +551,7 @@ resource "aws_iam_role" "flowlogs_role" {
   name               = "${local.name_prefix}-flowlogs-role"
   assume_role_policy = data.aws_iam_policy_document.flowlogs_assume_role.json
 }
-
+#tfsec:ignore:aws-iam-no-policy-wildcards AWS VPC Flow Logs documentation requires wildcard-style CloudWatch Logs permissions for service delivery
 data "aws_iam_policy_document" "flowlogs_policy_doc" {
   statement {
     effect = "Allow"
@@ -572,6 +572,7 @@ resource "aws_iam_role_policy" "flowlogs_policy" {
   name   = "${local.name_prefix}-flowlogs-policy"
   role   = aws_iam_role.flowlogs_role.id
   policy = data.aws_iam_policy_document.flowlogs_policy_doc.json
+
 }
 
 resource "aws_flow_log" "main" {
