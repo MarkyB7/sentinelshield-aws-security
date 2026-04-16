@@ -1,0 +1,15 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
+# Sensitive files
+*.pem
+*.key
+
+# Lambda build
+lambda/function.zip
+
+# OS
+.DS_Store
