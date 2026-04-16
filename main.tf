@@ -630,6 +630,12 @@ resource "aws_cognito_user_pool_domain" "main" {
 # -------------------------
 # Lambda
 # -------------------------
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_file = "${path.module}/lambda/app.py"
+  output_path = "${path.module}/lambda/function.zip"
+}
+
 resource "aws_iam_role" "lambda_exec" {
   name = "${local.name_prefix}-lambda-exec-role"
 
@@ -658,7 +664,7 @@ resource "aws_lambda_function" "api" {
   handler          = "app.handler"
   runtime          = "python3.12"
   filename         = "${path.module}/lambda/function.zip"
-  source_code_hash = filebase64sha256("${path.module}/lambda/function.zip")
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
   timeout          = 10
 
   environment {

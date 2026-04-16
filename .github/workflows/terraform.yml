@@ -13,6 +13,16 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Build Lambda package
+      run: |
+        cd lambda
+        zip -r function.zip app.py
+
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v3
 
@@ -25,9 +35,6 @@ jobs:
     - name: Terraform Validate
       run: terraform validate
 
-    - name: Terraform Plan
-      run: terraform plan
-
     - name: Run tfsec
       uses: aquasecurity/tfsec-action@v1.0.3
 
@@ -35,3 +42,12 @@ jobs:
       uses: aquasecurity/trivy-action@master
       with:
         scan-type: config
+        scan-ref: .
+
+    - name: Terraform Plan
+      if: ${{ github.event_name == 'pull_request' && secrets.AWS_ACCESS_KEY_ID != '' && secrets.AWS_SECRET_ACCESS_KEY != '' }}
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: us-east-1
+      run: terraform plan -input=false
