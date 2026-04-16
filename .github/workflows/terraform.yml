@@ -44,8 +44,7 @@ jobs:
         scan-type: config
         scan-ref: .
 
-    - name: Terraform Plan
-      if: ${{ github.event_name == 'pull_request' && secrets.AWS_ACCESS_KEY_ID != '' && secrets.AWS_SECRET_ACCESS_KEY != '' }}
+       -  name: Terraform Plan
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
