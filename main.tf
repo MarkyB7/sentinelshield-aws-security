@@ -663,7 +663,7 @@ resource "aws_lambda_function" "api" {
   role             = aws_iam_role.lambda_exec.arn
   handler          = "app.handler"
   runtime          = "python3.12"
-  filename         = "${path.module}/lambda/function.zip"
+  filename         = data.archive_file.lambda_zip.output_path
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
   timeout          = 10
 
