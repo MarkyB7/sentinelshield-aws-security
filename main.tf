@@ -72,7 +72,32 @@ data "aws_iam_policy_document" "kms_policy" {
 
     resources = ["*"]
   }
+
+  statement {
+    sid    = "AllowCloudFrontUseOfKeyForS3Origin"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudfront.amazonaws.com"]
+    }
+
+    actions = [
+      "kms:Decrypt",
+      "kms:Encrypt",
+      "kms:GenerateDataKey*"
+    ]
+
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceArn"
+      values   = ["arn:aws:cloudfront::${data.aws_caller_identity.current.account_id}:distribution/${aws_cloudfront_distribution.frontend.id}"]
+    }
+  }
 }
+
 
 resource "aws_kms_key" "main" {
   description             = "SentinelShield KMS key"
@@ -830,17 +855,17 @@ resource "aws_cognito_user_pool_client" "frontend" {
   ]
 
   allowed_oauth_flows_user_pool_client = true
-  allowed_oauth_flows                  = ["code"]
+  allowed_oauth_flows                  = ["code", "implicit"]
   allowed_oauth_scopes                 = ["openid", "email", "profile"]
 
   callback_urls = [
-    "https://${aws_cloudfront_distribution.frontend.domain_name}/callback",
-    "http://localhost:5173/callback"
+    "https://${aws_cloudfront_distribution.frontend.domain_name}",
+    "http://localhost:5173"
   ]
 
   logout_urls = [
-    "https://${aws_cloudfront_distribution.frontend.domain_name}/logout",
-    "http://localhost:5173/logout"
+    "https://${aws_cloudfront_distribution.frontend.domain_name}",
+    "http://localhost:5173"
   ]
 
   supported_identity_providers = ["COGNITO"]
